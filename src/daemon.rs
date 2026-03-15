@@ -161,12 +161,20 @@ pub fn run_daemon(shell: &str, cols: u16, rows: u16) -> Result<()> {
             drop(s);
 
             // Non-blocking check: is there data from the client?
-            let available = pipe_bytes_available_raw(&client_file);
-            if available == 0 {
-                // No data — sleep briefly and retry.
-                thread::sleep(Duration::from_millis(2));
-                continue;
-            }
+            let available = match pipe_bytes_available_raw(&client_file) {
+                Some(0) => {
+                    // No data yet — sleep briefly and retry.
+                    thread::sleep(Duration::from_millis(2));
+                    continue;
+                }
+                Some(n) => n,
+                None => {
+                    // Pipe broken — client disconnected (e.g. window closed).
+                    let mut s = state.lock().unwrap();
+                    s.client_writer = None;
+                    break;
+                }
+            };
 
             let to_read = available.min(read_buf.len());
             match client_file.read(&mut read_buf[..to_read]) {
@@ -223,6 +231,10 @@ pub fn run_daemon(shell: &str, cols: u16, rows: u16) -> Result<()> {
                 }
             }
         }
+
+        // Disconnect and drop the old pipe so a new instance can be created.
+        disconnect_pipe(&client_file);
+        drop(client_file);
     }
 
     // Clean up PID file.
@@ -370,8 +382,9 @@ fn kill_process(pid: u32) -> Result<()> {
 }
 
 /// Return the number of bytes available to read from a pipe without blocking.
+/// Returns `None` if the pipe is broken (client disconnected).
 #[cfg(windows)]
-fn pipe_bytes_available_raw(pipe: &std::fs::File) -> usize {
+fn pipe_bytes_available_raw(pipe: &std::fs::File) -> Option<usize> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::System::Pipes::PeekNamedPipe;
     let mut available: u32 = 0;
@@ -385,13 +398,26 @@ fn pipe_bytes_available_raw(pipe: &std::fs::File) -> usize {
             std::ptr::null_mut(),
         )
     };
-    if ok != 0 { available as usize } else { 0 }
+    if ok != 0 { Some(available as usize) } else { None }
 }
 
 #[cfg(not(windows))]
-fn pipe_bytes_available_raw(_pipe: &std::fs::File) -> usize {
-    0
+fn pipe_bytes_available_raw(_pipe: &std::fs::File) -> Option<usize> {
+    Some(0)
 }
+
+/// Disconnect a named pipe server handle so it can be reused or closed cleanly.
+#[cfg(windows)]
+fn disconnect_pipe(pipe: &std::fs::File) {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::Pipes::DisconnectNamedPipe;
+    unsafe {
+        DisconnectNamedPipe(pipe.as_raw_handle() as _);
+    }
+}
+
+#[cfg(not(windows))]
+fn disconnect_pipe(_pipe: &std::fs::File) {}
 
 // --- Named pipe helpers ---
 
