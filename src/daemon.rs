@@ -121,37 +121,55 @@ pub fn run_daemon(shell: &str, cols: u16, rows: u16) -> Result<()> {
         // Create named pipe instance and wait for a client.
         let pipe = create_pipe_instance()?;
         // Wait for client to connect (blocking).
-        let client_file = wait_for_client(pipe)?;
+        let mut client_file = wait_for_client(pipe)?;
 
-        // Set this client as the active writer.
-        let writer_file = client_file.try_clone()?;
+        // Use a single handle for both reading and writing — no try_clone().
+        // try_clone() uses DuplicateHandle which creates two handles sharing
+        // one file object; synchronous I/O serializes per file object, so a
+        // blocking read would prevent the PTY thread from writing output.
         {
             let mut s = state.lock().unwrap();
 
-            // Send scrollback replay.
-            let mut writer = PipeWriter {
-                handle: writer_file,
-            };
+            // Send scrollback replay using the pipe directly.
             let replay = s.scrollback.replay();
             if !replay.is_empty() {
-                let _ = writer.send(&DaemonMsg::ScrollbackReplay(replay));
+                let frame = protocol::encode(&DaemonMsg::ScrollbackReplay(replay))?;
+                let _ = std::io::Write::write_all(&mut &client_file, &frame);
             }
-            s.client_writer = Some(writer);
+
+            // Store a writer that uses the same handle (via try_clone).
+            // This is safe because we will NOT do blocking reads — we use
+            // PeekNamedPipe to check for data first, so the read never blocks
+            // long enough to prevent writes.
+            let writer_file = client_file.try_clone()?;
+            s.client_writer = Some(PipeWriter {
+                handle: writer_file,
+            });
         }
 
         // Read from this client until it disconnects.
-        let mut reader = std::io::BufReader::new(client_file);
+        // Use PeekNamedPipe + short sleep instead of blocking read to avoid
+        // serializing with the PTY thread's writes on the cloned handle.
         let mut read_buf = vec![0u8; 8192];
         let mut msg_buf = Vec::new();
 
-        loop {
+        'client: loop {
             let s = state.lock().unwrap();
             if s.shell_exited {
                 break;
             }
             drop(s);
 
-            match reader.read(&mut read_buf) {
+            // Non-blocking check: is there data from the client?
+            let available = pipe_bytes_available_raw(&client_file);
+            if available == 0 {
+                // No data — sleep briefly and retry.
+                thread::sleep(Duration::from_millis(2));
+                continue;
+            }
+
+            let to_read = available.min(read_buf.len());
+            match client_file.read(&mut read_buf[..to_read]) {
                 Ok(0) => {
                     // Client disconnected.
                     let mut s = state.lock().unwrap();
@@ -184,7 +202,7 @@ pub fn run_daemon(shell: &str, cols: u16, rows: u16) -> Result<()> {
                                     ClientMsg::Detach => {
                                         let mut s = state.lock().unwrap();
                                         s.client_writer = None;
-                                        break;
+                                        break 'client;
                                     }
                                 }
                             }
@@ -193,7 +211,7 @@ pub fn run_daemon(shell: &str, cols: u16, rows: u16) -> Result<()> {
                                 // Corrupt message — drop client.
                                 let mut s = state.lock().unwrap();
                                 s.client_writer = None;
-                                break;
+                                break 'client;
                             }
                         }
                     }
@@ -351,11 +369,36 @@ fn kill_process(pid: u32) -> Result<()> {
     Ok(())
 }
 
+/// Return the number of bytes available to read from a pipe without blocking.
+#[cfg(windows)]
+fn pipe_bytes_available_raw(pipe: &std::fs::File) -> usize {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+    let mut available: u32 = 0;
+    let ok = unsafe {
+        PeekNamedPipe(
+            pipe.as_raw_handle() as _,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            &mut available,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok != 0 { available as usize } else { 0 }
+}
+
+#[cfg(not(windows))]
+fn pipe_bytes_available_raw(_pipe: &std::fs::File) -> usize {
+    0
+}
+
 // --- Named pipe helpers ---
 
 #[cfg(windows)]
 fn create_pipe_instance() -> Result<std::fs::File> {
     use std::os::windows::io::FromRawHandle;
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
     use windows_sys::Win32::System::Pipes::CreateNamedPipeW;
 
     let pipe_name = to_wide(PIPE_NAME);
@@ -371,8 +414,11 @@ fn create_pipe_instance() -> Result<std::fs::File> {
             0,          // default timeout
             std::ptr::null(),
         );
-        if handle.is_null() {
-            anyhow::bail!("Failed to create named pipe");
+        if handle == INVALID_HANDLE_VALUE {
+            anyhow::bail!(
+                "Failed to create named pipe: {}",
+                std::io::Error::last_os_error()
+            );
         }
         Ok(std::fs::File::from_raw_handle(handle as _))
     }
@@ -385,7 +431,7 @@ fn wait_for_client(pipe: std::fs::File) -> Result<std::fs::File> {
 
     unsafe {
         let handle = pipe.as_raw_handle();
-        let _result = ConnectNamedPipe(handle, std::ptr::null_mut());
+        let _result = ConnectNamedPipe(handle as _, std::ptr::null_mut());
         // ConnectNamedPipe returns 0 on success when client is already connected
         // (ERROR_PIPE_CONNECTED) — either way, the pipe is usable.
     }

@@ -1,106 +1,119 @@
 use std::io::{Read, Write};
-use std::thread;
 
 use anyhow::{Context, Result};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::terminal;
 
 use crate::protocol::{self, ClientMsg, DaemonMsg, PIPE_NAME};
 
 /// Connect to the daemon and relay I/O until detach or session end.
 pub fn attach() -> Result<()> {
-    let pipe = connect_to_daemon().context("Failed to connect to daemon")?;
-    let mut pipe_writer = pipe.try_clone()?;
-    let mut pipe_reader = pipe;
+    let mut pipe = connect_to_daemon().context("Failed to connect to daemon")?;
 
     // Send initial terminal size.
     let (cols, rows) = terminal::size().unwrap_or((120, 30));
     let resize_msg = protocol::encode(&ClientMsg::Resize { cols, rows })?;
-    pipe_writer.write_all(&resize_msg)?;
+    pipe.write_all(&resize_msg)?;
+
+    // Enable VT sequence processing on stdout so that escape sequences from
+    // the ConPTY are rendered correctly (required on legacy consoles).
+    enable_virtual_terminal_processing();
 
     // Enter raw mode.
     terminal::enable_raw_mode()?;
     let _raw_guard = RawModeGuard;
 
     let mut stdout = std::io::stdout();
+    let mut msg_buf = Vec::new();
+    let mut read_buf = vec![0u8; 8192];
 
-    // Thread: read daemon messages → stdout.
-    let daemon_reader = thread::spawn(move || -> Result<()> {
-        let mut buf = vec![0u8; 8192];
-        let mut msg_buf = Vec::new();
-        loop {
-            match pipe_reader.read(&mut buf) {
-                Ok(0) => break, // Pipe closed.
-                Ok(n) => {
-                    msg_buf.extend_from_slice(&buf[..n]);
-                    loop {
-                        match protocol::decode::<DaemonMsg>(&msg_buf) {
-                            Ok(Some((msg, consumed))) => {
-                                msg_buf.drain(..consumed);
-                                match msg {
-                                    DaemonMsg::Output(data) => {
-                                        stdout.write_all(&data)?;
-                                        stdout.flush()?;
-                                    }
-                                    DaemonMsg::ScrollbackReplay(data) => {
-                                        stdout.write_all(&data)?;
-                                        stdout.flush()?;
-                                    }
-                                    DaemonMsg::SessionEnded => {
-                                        return Ok(());
-                                    }
-                                }
-                            }
-                            Ok(None) => break,
-                            Err(_) => return Ok(()),
-                        }
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-        Ok(())
-    });
-
-    // Main thread: read terminal input → daemon.
+    // Simple poll loop: drain pipe output, then wait for keyboard input with
+    // a short timeout. The timeout ensures we check for new pipe data
+    // frequently even when no keys are pressed.
     loop {
-        if event::poll(std::time::Duration::from_millis(100))? {
+        // Drain any available pipe data → stdout.
+        if drain_pipe(&mut pipe, &mut msg_buf, &mut read_buf, &mut stdout)? {
+            break; // session ended or pipe closed
+        }
+
+        // Wait up to 5ms for a keyboard event (also serves as our sleep to
+        // avoid busy-waiting). Pipe output latency is at most 5ms.
+        if event::poll(std::time::Duration::from_millis(5))? {
             match event::read()? {
                 Event::Key(KeyEvent {
                     code: KeyCode::Char('d'),
                     modifiers: KeyModifiers::CONTROL,
+                    kind: KeyEventKind::Press,
                     ..
                 }) => {
-                    // Ctrl+D with no input: detach.
                     let msg = protocol::encode(&ClientMsg::Detach)?;
-                    let _ = pipe_writer.write_all(&msg);
-                    break;
+                    let _ = pipe.write_all(&msg);
+                    return Ok(());
                 }
-                Event::Key(key_event) => {
+                Event::Key(key_event) if key_event.kind == KeyEventKind::Press => {
                     if let Some(bytes) = key_event_to_bytes(&key_event) {
                         let msg = protocol::encode(&ClientMsg::Input(bytes))?;
-                        if pipe_writer.write_all(&msg).is_err() {
-                            break;
+                        if pipe.write_all(&msg).is_err() {
+                            return Ok(());
                         }
                     }
                 }
                 Event::Resize(cols, rows) => {
                     let msg = protocol::encode(&ClientMsg::Resize { cols, rows })?;
-                    if pipe_writer.write_all(&msg).is_err() {
-                        break;
+                    if pipe.write_all(&msg).is_err() {
+                        return Ok(());
                     }
                 }
                 _ => {}
             }
         }
-
-        // Check if daemon reader thread has finished.
-        if daemon_reader.is_finished() {
-            break;
-        }
     }
 
     Ok(())
+}
+
+/// Read all available data from the pipe and write decoded output to stdout.
+/// Returns true if the session has ended (pipe closed or SessionEnded).
+fn drain_pipe(
+    pipe: &mut std::fs::File,
+    msg_buf: &mut Vec<u8>,
+    read_buf: &mut [u8],
+    stdout: &mut std::io::Stdout,
+) -> Result<bool> {
+    loop {
+        let available = pipe_bytes_available(pipe);
+        if available == 0 {
+            return Ok(false);
+        }
+        let to_read = available.min(read_buf.len());
+        match pipe.read(&mut read_buf[..to_read]) {
+            Ok(0) => return Ok(true),
+            Ok(n) => {
+                msg_buf.extend_from_slice(&read_buf[..n]);
+                loop {
+                    match protocol::decode::<DaemonMsg>(msg_buf) {
+                        Ok(Some((msg, consumed))) => {
+                            msg_buf.drain(..consumed);
+                            match msg {
+                                DaemonMsg::Output(data) => {
+                                    stdout.write_all(&data)?;
+                                    stdout.flush()?;
+                                }
+                                DaemonMsg::ScrollbackReplay(data) => {
+                                    stdout.write_all(&data)?;
+                                    stdout.flush()?;
+                                }
+                                DaemonMsg::SessionEnded => return Ok(true),
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(_) => return Ok(true),
+                    }
+                }
+            }
+            Err(_) => return Ok(true),
+        }
+    }
 }
 
 /// RAII guard to restore terminal mode on drop.
@@ -112,13 +125,56 @@ impl Drop for RawModeGuard {
     }
 }
 
+/// Enable ENABLE_VIRTUAL_TERMINAL_PROCESSING on stdout.
+#[cfg(windows)]
+fn enable_virtual_terminal_processing() {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::Console::{
+        GetConsoleMode, SetConsoleMode, ENABLE_PROCESSED_OUTPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+    };
+    unsafe {
+        let handle = std::io::stdout().as_raw_handle();
+        let mut mode: u32 = 0;
+        if GetConsoleMode(handle as _, &mut mode) != 0 {
+            let new_mode = mode | ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+            SetConsoleMode(handle as _, new_mode);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn enable_virtual_terminal_processing() {}
+
+/// Return the number of bytes available to read from the pipe without blocking.
+#[cfg(windows)]
+fn pipe_bytes_available(pipe: &std::fs::File) -> usize {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+    let mut available: u32 = 0;
+    let ok = unsafe {
+        PeekNamedPipe(
+            pipe.as_raw_handle() as _,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            &mut available,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok != 0 { available as usize } else { 0 }
+}
+
+#[cfg(not(windows))]
+fn pipe_bytes_available(_pipe: &std::fs::File) -> usize {
+    0
+}
+
 /// Convert a crossterm key event to the bytes that should be sent to the PTY.
 fn key_event_to_bytes(event: &KeyEvent) -> Option<Vec<u8>> {
     let ctrl = event.modifiers.contains(KeyModifiers::CONTROL);
     match event.code {
         KeyCode::Char(c) => {
             if ctrl {
-                // Ctrl+A = 0x01, Ctrl+B = 0x02, ...
                 let byte = (c as u8).wrapping_sub(b'a').wrapping_add(1);
                 Some(vec![byte])
             } else {
@@ -166,8 +222,6 @@ fn key_event_to_bytes(event: &KeyEvent) -> Option<Vec<u8>> {
 #[cfg(windows)]
 fn connect_to_daemon() -> Result<std::fs::File> {
     use std::fs::OpenOptions;
-
-    // Try connecting to the named pipe.
     let file = OpenOptions::new()
         .read(true)
         .write(true)
