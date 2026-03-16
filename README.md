@@ -28,6 +28,10 @@ mm --scrollback 5000    # Set scrollback buffer size in lines (default: 1000)
 
 `mm` runs a background daemon that holds a [ConPTY](https://devblogs.microsoft.com/commandline/windows-command-line-introducing-the-windows-pseudo-console-conpty/) session. The client connects to the daemon via a Windows named pipe, relays keyboard input, and displays terminal output. On reattach, scrollback history is replayed so you can see what happened while detached.
 
+## Known limitations
+
+- **Window resize garbles scrollback.** minimux relays raw PTY output to your terminal. When you resize the window, the terminal reflows its buffer and ConPTY sends reflow sequences — the two conflict, producing duplicated/garbled content in scrollback history. The visible screen recovers after the shell redraws, but scrollback history will be messy. If you use a fixed-size terminal (e.g. SSH from a phone/tablet), this is a non-issue.
+
 ## Requirements
 
 - Windows 10 (1809+) or Windows 11
