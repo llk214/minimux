@@ -283,10 +283,30 @@ pub fn is_daemon_running() -> Result<Option<u32>> {
 /// Kill the daemon process.
 pub fn kill_daemon() -> Result<()> {
     if let Some(pid) = is_daemon_running()? {
-        kill_process(pid)?;
         let pid_path = get_state_dir()?.join("daemon.pid");
-        let _ = std::fs::remove_file(&pid_path);
-        println!("Daemon (PID {}) killed.", pid);
+        if pid != 0 {
+            match kill_process(pid) {
+                Ok(()) => {
+                    let _ = std::fs::remove_file(&pid_path);
+                    println!("Daemon (PID {}) killed.", pid);
+                }
+                Err(_) => {
+                    // May fail if daemon is in a different session — suggest elevation.
+                    println!(
+                        "Could not kill daemon (PID {}). Try running as administrator:\n  \
+                         taskkill /F /PID {}",
+                        pid, pid
+                    );
+                }
+            }
+        } else {
+            // Daemon is reachable via pipe but PID is unknown — can't kill directly.
+            println!(
+                "Daemon is running but its PID could not be determined.\n\
+                 Find it with: tasklist | findstr mm.exe\n\
+                 Then kill with: taskkill /F /PID <pid>"
+            );
+        }
     } else {
         println!("No daemon running.");
     }
@@ -329,8 +349,10 @@ pub fn start_daemon_background(shell: &str, scrollback: usize) -> Result<()> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
-        cmd.creation_flags(0x00000008 | 0x00000200);
+        // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB
+        // CREATE_BREAKAWAY_FROM_JOB is needed so the daemon survives when an SSH
+        // session ends (Windows OpenSSH uses job objects to kill session processes).
+        cmd.creation_flags(0x00000008 | 0x00000200 | 0x01000000);
     }
 
     cmd.stdin(std::process::Stdio::null())
@@ -361,7 +383,10 @@ fn is_process_alive(pid: u32) -> bool {
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
         if handle.is_null() {
-            return false;
+            // OpenProcess failed. ERROR_ACCESS_DENIED (5) means the process
+            // exists but is in a different session (e.g. started via SSH).
+            // Any other error (e.g. ERROR_INVALID_PARAMETER) means it's dead.
+            return std::io::Error::last_os_error().raw_os_error() == Some(5);
         }
         CloseHandle(handle);
         true
@@ -441,12 +466,39 @@ fn disconnect_pipe(_pipe: &std::fs::File) {}
 #[cfg(windows)]
 fn create_pipe_instance() -> Result<std::fs::File> {
     use std::os::windows::io::FromRawHandle;
-    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Foundation::{LocalFree, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
+    use windows_sys::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
     use windows_sys::Win32::System::Pipes::CreateNamedPipeW;
 
     let pipe_name = to_wide(PIPE_NAME);
 
     unsafe {
+        // Use SDDL to create a security descriptor that grants full access to
+        // all authenticated users. This ensures the pipe is accessible across
+        // sessions (e.g. daemon started via SSH, client attached from desktop).
+        // D: = DACL, A = Allow, GA = Generic All, AU = Authenticated Users.
+        let sddl = to_wide("D:(A;;GA;;;AU)");
+        let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        let ok = ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            1, // SDDL_REVISION_1
+            &mut sd,
+            std::ptr::null_mut(),
+        );
+        if ok == 0 {
+            anyhow::bail!(
+                "Failed to create security descriptor: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+
+        let mut sa = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: sd as *mut _,
+            bInheritHandle: 0,
+        };
+
         let handle = CreateNamedPipeW(
             pipe_name.as_ptr(),
             0x00000003, // PIPE_ACCESS_DUPLEX
@@ -455,8 +507,10 @@ fn create_pipe_instance() -> Result<std::fs::File> {
             8192,       // out buffer
             8192,       // in buffer
             0,          // default timeout
-            std::ptr::null(),
+            &mut sa as *mut _ as *const _,
         );
+        LocalFree(sd as _);
+
         if handle == INVALID_HANDLE_VALUE {
             anyhow::bail!(
                 "Failed to create named pipe: {}",
