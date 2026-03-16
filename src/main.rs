@@ -89,6 +89,11 @@ fn main() -> anyhow::Result<()> {
             daemon::kill_daemon()?;
         }
         None => {
+            // Detect nested mm sessions.
+            if std::env::var_os("MM_SESSION").is_some() {
+                anyhow::bail!("Already inside an mm session. Use Ctrl+D to detach.");
+            }
+
             // Default: attach to existing session, or create one.
             if daemon::is_daemon_running()?.is_none() {
                 println!("Starting new session...");

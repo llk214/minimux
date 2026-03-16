@@ -51,7 +51,8 @@ pub fn run_daemon(shell: &str, cols: u16, rows: u16) -> Result<()> {
         .context("Failed to open PTY")?;
 
     // Spawn shell.
-    let cmd = CommandBuilder::new(shell);
+    let mut cmd = CommandBuilder::new(shell);
+    cmd.env("MM_SESSION", "1");
     let _child = pair
         .slave
         .spawn_command(cmd)
