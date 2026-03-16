@@ -110,6 +110,11 @@ pub fn run_daemon(shell: &str, cols: u16, rows: u16) -> Result<()> {
         }
     });
 
+    // Create a single named pipe instance that we reuse across clients.
+    // The Windows pattern is: CreateNamedPipe → ConnectNamedPipe → serve →
+    // DisconnectNamedPipe → ConnectNamedPipe → serve → ... (reuse the handle).
+    let server_pipe = create_pipe_instance()?;
+
     // Main loop: accept client connections on the named pipe.
     loop {
         {
@@ -119,38 +124,28 @@ pub fn run_daemon(shell: &str, cols: u16, rows: u16) -> Result<()> {
             }
         }
 
-        // Create named pipe instance and wait for a client.
-        let pipe = create_pipe_instance()?;
-        // Wait for client to connect (blocking).
-        let mut client_file = wait_for_client(pipe)?;
+        // Wait for a client to connect (blocking).
+        wait_for_client(&server_pipe)?;
 
-        // Use a single handle for both reading and writing — no try_clone().
-        // try_clone() uses DuplicateHandle which creates two handles sharing
-        // one file object; synchronous I/O serializes per file object, so a
-        // blocking read would prevent the PTY thread from writing output.
         {
             let mut s = state.lock().unwrap();
 
-            // Send scrollback replay using the pipe directly.
+            // Send scrollback replay.
             let replay = s.scrollback.replay();
             if !replay.is_empty() {
                 let frame = protocol::encode(&DaemonMsg::ScrollbackReplay(replay))?;
-                let _ = std::io::Write::write_all(&mut &client_file, &frame);
+                let _ = std::io::Write::write_all(&mut &server_pipe, &frame);
             }
 
-            // Store a writer that uses the same handle (via try_clone).
-            // This is safe because we will NOT do blocking reads — we use
-            // PeekNamedPipe to check for data first, so the read never blocks
-            // long enough to prevent writes.
-            let writer_file = client_file.try_clone()?;
+            // Store a writer clone for the PTY reader thread.
+            // Safe because we use PeekNamedPipe for non-blocking reads.
+            let writer_file = server_pipe.try_clone()?;
             s.client_writer = Some(PipeWriter {
                 handle: writer_file,
             });
         }
 
         // Read from this client until it disconnects.
-        // Use PeekNamedPipe + short sleep instead of blocking read to avoid
-        // serializing with the PTY thread's writes on the cloned handle.
         let mut read_buf = vec![0u8; 8192];
         let mut msg_buf = Vec::new();
         let mut idle_count: u32 = 0;
@@ -163,10 +158,8 @@ pub fn run_daemon(shell: &str, cols: u16, rows: u16) -> Result<()> {
             drop(s);
 
             // Non-blocking check: is there data from the client?
-            let available = match pipe_bytes_available_raw(&client_file) {
+            let available = match pipe_bytes_available_raw(&server_pipe) {
                 Some(0) => {
-                    // No data yet — adaptive sleep: short when recently active,
-                    // longer when idle to avoid unnecessary CPU wake-ups.
                     idle_count = idle_count.saturating_add(1);
                     let sleep_ms = if idle_count < 10 {
                         2
@@ -183,7 +176,6 @@ pub fn run_daemon(shell: &str, cols: u16, rows: u16) -> Result<()> {
                     n
                 }
                 None => {
-                    // Pipe broken — client disconnected (e.g. window closed).
                     let mut s = state.lock().unwrap();
                     s.client_writer = None;
                     break;
@@ -191,16 +183,14 @@ pub fn run_daemon(shell: &str, cols: u16, rows: u16) -> Result<()> {
             };
 
             let to_read = available.min(read_buf.len());
-            match client_file.read(&mut read_buf[..to_read]) {
+            match (&server_pipe).read(&mut read_buf[..to_read]) {
                 Ok(0) => {
-                    // Client disconnected.
                     let mut s = state.lock().unwrap();
                     s.client_writer = None;
                     break;
                 }
                 Ok(n) => {
                     msg_buf.extend_from_slice(&read_buf[..n]);
-                    // Process all complete messages in the buffer.
                     loop {
                         match protocol::decode::<ClientMsg>(&msg_buf) {
                             Ok(Some((msg, consumed))) => {
@@ -228,9 +218,8 @@ pub fn run_daemon(shell: &str, cols: u16, rows: u16) -> Result<()> {
                                     }
                                 }
                             }
-                            Ok(None) => break, // Need more data.
+                            Ok(None) => break,
                             Err(_) => {
-                                // Corrupt message — drop client.
                                 let mut s = state.lock().unwrap();
                                 s.client_writer = None;
                                 break 'client;
@@ -246,13 +235,9 @@ pub fn run_daemon(shell: &str, cols: u16, rows: u16) -> Result<()> {
             }
         }
 
-        // Disconnect and drop the old pipe so a new instance can be created.
-        disconnect_pipe(&client_file);
-        drop(client_file);
-
-        // Brief pause before accepting the next client to prevent a tight loop
-        // if pipe creation or connection enters a failure cycle.
-        thread::sleep(Duration::from_millis(100));
+        // Disconnect the client but keep the pipe handle for reuse.
+        // Important: client_writer must already be None (dropped) before this.
+        disconnect_pipe(&server_pipe);
     }
 
     // Clean up PID file.
@@ -523,7 +508,7 @@ fn create_pipe_instance() -> Result<std::fs::File> {
 }
 
 #[cfg(windows)]
-fn wait_for_client(pipe: std::fs::File) -> Result<std::fs::File> {
+fn wait_for_client(pipe: &std::fs::File) -> Result<()> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Foundation::ERROR_PIPE_CONNECTED;
     use windows_sys::Win32::System::Pipes::ConnectNamedPipe;
@@ -532,16 +517,13 @@ fn wait_for_client(pipe: std::fs::File) -> Result<std::fs::File> {
         let handle = pipe.as_raw_handle();
         let result = ConnectNamedPipe(handle as _, std::ptr::null_mut());
         if result == 0 {
-            // ConnectNamedPipe returns 0 (FALSE) on failure. ERROR_PIPE_CONNECTED
-            // means a client connected between CreateNamedPipe and ConnectNamedPipe
-            // — that's fine, the pipe is usable. Any other error is a real failure.
             let err = std::io::Error::last_os_error();
             if err.raw_os_error() != Some(ERROR_PIPE_CONNECTED as i32) {
                 anyhow::bail!("ConnectNamedPipe failed: {}", err);
             }
         }
     }
-    Ok(pipe)
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -559,6 +541,6 @@ fn create_pipe_instance() -> Result<std::fs::File> {
 }
 
 #[cfg(not(windows))]
-fn wait_for_client(_pipe: std::fs::File) -> Result<std::fs::File> {
+fn wait_for_client(_pipe: &std::fs::File) -> Result<()> {
     anyhow::bail!("Named pipes only supported on Windows");
 }

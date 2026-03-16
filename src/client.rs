@@ -224,12 +224,22 @@ fn key_event_to_bytes(event: &KeyEvent) -> Option<Vec<u8>> {
 #[cfg(windows)]
 fn connect_to_daemon() -> Result<std::fs::File> {
     use std::fs::OpenOptions;
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(PIPE_NAME)
-        .context("Could not connect to daemon pipe")?;
-    Ok(file)
+    // Retry a few times — the pipe may not exist yet if the daemon just started
+    // or is between client sessions (brief window after disconnect before the
+    // next pipe instance is created).
+    let mut last_err = None;
+    for i in 0..20 {
+        match OpenOptions::new().read(true).write(true).open(PIPE_NAME) {
+            Ok(file) => return Ok(file),
+            Err(e) => {
+                last_err = Some(e);
+                if i < 19 {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap()).context("Could not connect to daemon pipe (timed out after 2s)")
 }
 
 #[cfg(not(windows))]
