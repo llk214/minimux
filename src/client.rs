@@ -122,6 +122,9 @@ fn drain_pipe(
                                     stdout.flush()?;
                                 }
                                 DaemonMsg::ScrollbackReplay(data) => {
+                                    // Reset terminal before replaying to avoid
+                                    // mixing stale client state with the replay.
+                                    stdout.write_all(b"\x1bc")?;
                                     stdout.write_all(&data)?;
                                     stdout.flush()?;
                                 }

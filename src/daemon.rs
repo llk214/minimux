@@ -33,6 +33,30 @@ impl PipeWriter {
 
 /// Run the daemon: create the PTY, start the shell, listen for clients.
 pub fn run_daemon(shell: &str, cols: u16, rows: u16) -> Result<()> {
+    // Install panic hook that logs to a file for debugging.
+    let log_path = get_state_dir()
+        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+        .join("daemon.log");
+    let log_path2 = log_path.clone();
+    std::panic::set_hook(Box::new(move |info| {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path2)
+        {
+            let _ = writeln!(f, "PANIC: {info}");
+        }
+    }));
+
+    let result = run_daemon_inner(shell, cols, rows);
+    if let Err(ref e) = result {
+        let _ = std::fs::write(&log_path, format!("ERROR: {e:?}\n"));
+    }
+    result
+}
+
+fn run_daemon_inner(shell: &str, cols: u16, rows: u16) -> Result<()> {
     // Write PID file.
     let pid_dir = get_state_dir()?;
     std::fs::create_dir_all(&pid_dir)?;
@@ -83,7 +107,7 @@ pub fn run_daemon(shell: &str, cols: u16, rows: u16) -> Result<()> {
             match pty_reader.read(&mut buf) {
                 Ok(0) => {
                     // PTY closed — shell exited.
-                    let mut s = state_pty.lock().unwrap();
+                    let mut s = state_pty.lock().unwrap_or_else(|e| e.into_inner());
                     s.shell_exited = true;
                     if let Some(ref mut w) = s.client_writer {
                         let _ = w.send(&DaemonMsg::SessionEnded);
@@ -92,7 +116,7 @@ pub fn run_daemon(shell: &str, cols: u16, rows: u16) -> Result<()> {
                 }
                 Ok(n) => {
                     let data = &buf[..n];
-                    let mut s = state_pty.lock().unwrap();
+                    let mut s = state_pty.lock().unwrap_or_else(|e| e.into_inner());
                     s.scrollback.feed(data);
                     if let Some(ref mut w) = s.client_writer {
                         if w.send(&DaemonMsg::Output(data.to_vec())).is_err() {
@@ -102,7 +126,7 @@ pub fn run_daemon(shell: &str, cols: u16, rows: u16) -> Result<()> {
                     }
                 }
                 Err(_) => {
-                    let mut s = state_pty.lock().unwrap();
+                    let mut s = state_pty.lock().unwrap_or_else(|e| e.into_inner());
                     s.shell_exited = true;
                     break;
                 }
@@ -118,7 +142,7 @@ pub fn run_daemon(shell: &str, cols: u16, rows: u16) -> Result<()> {
     // Main loop: accept client connections on the named pipe.
     loop {
         {
-            let s = state.lock().unwrap();
+            let s = state.lock().unwrap_or_else(|e| e.into_inner());
             if s.shell_exited {
                 break;
             }
@@ -128,7 +152,7 @@ pub fn run_daemon(shell: &str, cols: u16, rows: u16) -> Result<()> {
         wait_for_client(&server_pipe)?;
 
         {
-            let mut s = state.lock().unwrap();
+            let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
 
             // Send scrollback replay.
             let replay = s.scrollback.replay();
@@ -151,7 +175,7 @@ pub fn run_daemon(shell: &str, cols: u16, rows: u16) -> Result<()> {
         let mut idle_count: u32 = 0;
 
         'client: loop {
-            let s = state.lock().unwrap();
+            let s = state.lock().unwrap_or_else(|e| e.into_inner());
             if s.shell_exited {
                 break;
             }
@@ -176,7 +200,7 @@ pub fn run_daemon(shell: &str, cols: u16, rows: u16) -> Result<()> {
                     n
                 }
                 None => {
-                    let mut s = state.lock().unwrap();
+                    let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
                     s.client_writer = None;
                     break;
                 }
@@ -185,7 +209,7 @@ pub fn run_daemon(shell: &str, cols: u16, rows: u16) -> Result<()> {
             let to_read = available.min(read_buf.len());
             match (&server_pipe).read(&mut read_buf[..to_read]) {
                 Ok(0) => {
-                    let mut s = state.lock().unwrap();
+                    let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
                     s.client_writer = None;
                     break;
                 }
@@ -200,7 +224,7 @@ pub fn run_daemon(shell: &str, cols: u16, rows: u16) -> Result<()> {
                                         let _ = pty_writer.write_all(&data);
                                     }
                                     ClientMsg::Resize { cols, rows } => {
-                                        let mut s = state.lock().unwrap();
+                                        let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
                                         s.scrollback.resize(rows, cols);
                                         if let Ok(master) = pty_master.lock() {
                                             let _ = master.resize(PtySize {
@@ -212,7 +236,7 @@ pub fn run_daemon(shell: &str, cols: u16, rows: u16) -> Result<()> {
                                         }
                                     }
                                     ClientMsg::Detach => {
-                                        let mut s = state.lock().unwrap();
+                                        let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
                                         s.client_writer = None;
                                         break 'client;
                                     }
@@ -220,7 +244,7 @@ pub fn run_daemon(shell: &str, cols: u16, rows: u16) -> Result<()> {
                             }
                             Ok(None) => break,
                             Err(_) => {
-                                let mut s = state.lock().unwrap();
+                                let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
                                 s.client_writer = None;
                                 break 'client;
                             }
@@ -228,7 +252,7 @@ pub fn run_daemon(shell: &str, cols: u16, rows: u16) -> Result<()> {
                     }
                 }
                 Err(_) => {
-                    let mut s = state.lock().unwrap();
+                    let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
                     s.client_writer = None;
                     break;
                 }
