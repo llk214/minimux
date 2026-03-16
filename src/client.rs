@@ -81,10 +81,11 @@ fn drain_pipe(
     stdout: &mut std::io::Stdout,
 ) -> Result<bool> {
     loop {
-        let available = pipe_bytes_available(pipe);
-        if available == 0 {
-            return Ok(false);
-        }
+        let available = match pipe_bytes_available(pipe) {
+            Some(0) => return Ok(false),
+            Some(n) => n,
+            None => return Ok(true), // pipe broken — daemon gone
+        };
         let to_read = available.min(read_buf.len());
         match pipe.read(&mut read_buf[..to_read]) {
             Ok(0) => return Ok(true),
@@ -146,8 +147,9 @@ fn enable_virtual_terminal_processing() {
 fn enable_virtual_terminal_processing() {}
 
 /// Return the number of bytes available to read from the pipe without blocking.
+/// Returns `None` if the pipe is broken (daemon disconnected).
 #[cfg(windows)]
-fn pipe_bytes_available(pipe: &std::fs::File) -> usize {
+fn pipe_bytes_available(pipe: &std::fs::File) -> Option<usize> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::System::Pipes::PeekNamedPipe;
     let mut available: u32 = 0;
@@ -161,12 +163,12 @@ fn pipe_bytes_available(pipe: &std::fs::File) -> usize {
             std::ptr::null_mut(),
         )
     };
-    if ok != 0 { available as usize } else { 0 }
+    if ok != 0 { Some(available as usize) } else { None }
 }
 
 #[cfg(not(windows))]
-fn pipe_bytes_available(_pipe: &std::fs::File) -> usize {
-    0
+fn pipe_bytes_available(_pipe: &std::fs::File) -> Option<usize> {
+    Some(0)
 }
 
 /// Convert a crossterm key event to the bytes that should be sent to the PTY.

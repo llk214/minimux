@@ -152,6 +152,7 @@ pub fn run_daemon(shell: &str, cols: u16, rows: u16) -> Result<()> {
         // serializing with the PTY thread's writes on the cloned handle.
         let mut read_buf = vec![0u8; 8192];
         let mut msg_buf = Vec::new();
+        let mut idle_count: u32 = 0;
 
         'client: loop {
             let s = state.lock().unwrap();
@@ -163,11 +164,23 @@ pub fn run_daemon(shell: &str, cols: u16, rows: u16) -> Result<()> {
             // Non-blocking check: is there data from the client?
             let available = match pipe_bytes_available_raw(&client_file) {
                 Some(0) => {
-                    // No data yet — sleep briefly and retry.
-                    thread::sleep(Duration::from_millis(2));
+                    // No data yet — adaptive sleep: short when recently active,
+                    // longer when idle to avoid unnecessary CPU wake-ups.
+                    idle_count = idle_count.saturating_add(1);
+                    let sleep_ms = if idle_count < 10 {
+                        2
+                    } else if idle_count < 100 {
+                        10
+                    } else {
+                        50
+                    };
+                    thread::sleep(Duration::from_millis(sleep_ms));
                     continue;
                 }
-                Some(n) => n,
+                Some(n) => {
+                    idle_count = 0;
+                    n
+                }
                 None => {
                     // Pipe broken — client disconnected (e.g. window closed).
                     let mut s = state.lock().unwrap();
@@ -235,6 +248,10 @@ pub fn run_daemon(shell: &str, cols: u16, rows: u16) -> Result<()> {
         // Disconnect and drop the old pipe so a new instance can be created.
         disconnect_pipe(&client_file);
         drop(client_file);
+
+        // Brief pause before accepting the next client to prevent a tight loop
+        // if pipe creation or connection enters a failure cycle.
+        thread::sleep(Duration::from_millis(100));
     }
 
     // Clean up PID file.
@@ -453,13 +470,21 @@ fn create_pipe_instance() -> Result<std::fs::File> {
 #[cfg(windows)]
 fn wait_for_client(pipe: std::fs::File) -> Result<std::fs::File> {
     use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::ERROR_PIPE_CONNECTED;
     use windows_sys::Win32::System::Pipes::ConnectNamedPipe;
 
     unsafe {
         let handle = pipe.as_raw_handle();
-        let _result = ConnectNamedPipe(handle as _, std::ptr::null_mut());
-        // ConnectNamedPipe returns 0 on success when client is already connected
-        // (ERROR_PIPE_CONNECTED) — either way, the pipe is usable.
+        let result = ConnectNamedPipe(handle as _, std::ptr::null_mut());
+        if result == 0 {
+            // ConnectNamedPipe returns 0 (FALSE) on failure. ERROR_PIPE_CONNECTED
+            // means a client connected between CreateNamedPipe and ConnectNamedPipe
+            // — that's fine, the pipe is usable. Any other error is a real failure.
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() != Some(ERROR_PIPE_CONNECTED as i32) {
+                anyhow::bail!("ConnectNamedPipe failed: {}", err);
+            }
+        }
     }
     Ok(pipe)
 }
