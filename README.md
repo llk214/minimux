@@ -12,7 +12,10 @@ mm status       # Show session status
 mm kill         # Kill the running session
 ```
 
-Detach from a session with `Ctrl+D`. The session keeps running — reattach anytime with `mm`.
+Keybindings (tmux-style):
+
+- `Ctrl+B d` — detach from session (session keeps running — reattach anytime with `mm`)
+- `Ctrl+B Ctrl+B` — send literal Ctrl+B to the shell
 
 ## Options
 

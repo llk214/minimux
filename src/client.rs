@@ -26,6 +26,7 @@ pub fn attach() -> Result<()> {
     let mut stdout = std::io::stdout();
     let mut msg_buf = Vec::new();
     let mut read_buf = vec![0u8; 8192];
+    let mut prefix_mode = false;
 
     // Simple poll loop: drain pipe output, then wait for keyboard input with
     // a short timeout. The timeout ensures we check for new pipe data
@@ -40,18 +41,38 @@ pub fn attach() -> Result<()> {
         // avoid busy-waiting). Pipe output latency is at most 5ms.
         if event::poll(std::time::Duration::from_millis(5))? {
             match event::read()? {
+                // Ctrl+B: enter prefix mode (tmux-style).
                 Event::Key(KeyEvent {
-                    code: KeyCode::Char('d'),
+                    code: KeyCode::Char('b'),
                     modifiers: KeyModifiers::CONTROL,
                     kind: KeyEventKind::Press,
                     ..
                 }) => {
-                    let msg = protocol::encode(&ClientMsg::Detach)?;
-                    let _ = pipe.write_all(&msg);
-                    return Ok(());
+                    if prefix_mode {
+                        // Ctrl+B Ctrl+B: send literal Ctrl+B to the PTY.
+                        prefix_mode = false;
+                        let msg = protocol::encode(&ClientMsg::Input(vec![0x02]))?;
+                        if pipe.write_all(&msg).is_err() {
+                            return Ok(());
+                        }
+                    } else {
+                        prefix_mode = true;
+                    }
                 }
                 Event::Key(key_event) if key_event.kind == KeyEventKind::Press => {
-                    if let Some(bytes) = key_event_to_bytes(&key_event) {
+                    if prefix_mode {
+                        prefix_mode = false;
+                        match key_event.code {
+                            // Ctrl+B d: detach.
+                            KeyCode::Char('d') => {
+                                let msg = protocol::encode(&ClientMsg::Detach)?;
+                                let _ = pipe.write_all(&msg);
+                                return Ok(());
+                            }
+                            // Unknown prefix command — ignore.
+                            _ => {}
+                        }
+                    } else if let Some(bytes) = key_event_to_bytes(&key_event) {
                         let msg = protocol::encode(&ClientMsg::Input(bytes))?;
                         if pipe.write_all(&msg).is_err() {
                             return Ok(());
