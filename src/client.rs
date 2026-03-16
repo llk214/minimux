@@ -232,6 +232,24 @@ fn connect_to_daemon() -> Result<std::fs::File> {
         match OpenOptions::new().read(true).write(true).open(PIPE_NAME) {
             Ok(file) => return Ok(file),
             Err(e) => {
+                // ERROR_PIPE_BUSY (231) means the pipe exists but another
+                // client is already connected — no point retrying.
+                if e.raw_os_error() == Some(231) {
+                    anyhow::bail!(
+                        "Another client is already attached to this session.\n\
+                         Detach the other client first (Ctrl+D), then try again."
+                    );
+                }
+                // ERROR_ACCESS_DENIED (5) means the pipe exists but this
+                // session can't open it (e.g. daemon started from SSH,
+                // client running from desktop). No point retrying.
+                if e.raw_os_error() == Some(5) {
+                    anyhow::bail!(
+                        "Cannot access the daemon pipe (access denied).\n\
+                         The daemon may have been started from a different session.\n\
+                         Try: mm kill, then start a new session."
+                    );
+                }
                 last_err = Some(e);
                 if i < 19 {
                     std::thread::sleep(std::time::Duration::from_millis(100));
